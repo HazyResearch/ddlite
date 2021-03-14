@@ -14,6 +14,9 @@ from snorkel.labeling.analysis import LFAnalysis
 from snorkel.labeling.model.base_labeler import BaseLabeler
 from snorkel.labeling.model.graph_utils import get_clique_tree
 from snorkel.labeling.model.logger import Logger
+from snorkel.labeling.model.sparse_label_model.sparse_label_model_helpers import (
+    KnownDimensions,
+)
 from snorkel.types import Config
 from snorkel.utils.config_utils import merge_config
 from snorkel.utils.lr_schedulers import LRSchedulerConfig
@@ -188,19 +191,6 @@ class LabelModel(nn.Module, BaseLabeler):
         # Create a helper data structure which maps cliques (as tuples of member
         # sources) --> {start_index, end_index, maximal_cliques}, where
         # the last value is a set of indices in this data structure
-        self.c_data: Dict[int, _CliqueData] = {}
-        for i in range(self.m):
-            self.c_data[i] = _CliqueData(
-                start_index=i * self.cardinality,
-                end_index=(i + 1) * self.cardinality,
-                max_cliques=set(
-                    [
-                        j
-                        for j in self.c_tree.nodes()
-                        if i in self.c_tree.node[j]["members"]
-                    ]
-                ),
-            )
 
         L_ind = self._create_L_ind(L)
 
@@ -224,6 +214,21 @@ class LabelModel(nn.Module, BaseLabeler):
             return L_aug
         else:
             return L_ind
+
+    def _calculate_clique_data(self) -> None:
+        self.c_data: Dict[int, _CliqueData] = {}
+        for i in range(self.m):
+            self.c_data[i] = _CliqueData(
+                start_index=i * self.cardinality,
+                end_index=(i + 1) * self.cardinality,
+                max_cliques=set(
+                    [
+                        j
+                        for j in self.c_tree.nodes()
+                        if i in self.c_tree.node[j]["members"]
+                    ]
+                ),
+            )
 
     def _build_mask(self) -> None:
         """Build mask applied to O^{-1}, O for the matrix approx constraint."""
@@ -252,6 +257,10 @@ class LabelModel(nn.Module, BaseLabeler):
         """
         L_aug = self._get_augmented_label_matrix(L, higher_order=higher_order)
         self.d = L_aug.shape[1]
+        self._generate_O_from_L_aug(L_aug)
+
+    def _generate_O_from_L_aug(self, L_aug: np.ndarray) -> None:
+        """Generate O from L_aug. Extracted to a seperate method for the sake of testing."""
         self.O = (
             torch.from_numpy(L_aug.T @ L_aug / self.n).float().to(self.config.device)
         )
@@ -385,7 +394,7 @@ class LabelModel(nn.Module, BaseLabeler):
             accs[i] = np.diag(cprobs[i, 1:, :] @ self.P.cpu().detach().numpy()).sum()
         return np.clip(accs / self.coverage, 1e-6, 1.0)
 
-    def predict_proba(self, L: np.ndarray) -> np.ndarray:
+    def predict_proba(self, L: np.ndarray, is_augmented: bool = False) -> np.ndarray:
         r"""Return label probabilities P(Y | \lambda).
 
         Parameters
@@ -408,9 +417,14 @@ class LabelModel(nn.Module, BaseLabeler):
                [0., 1.],
                [0., 1.]])
         """
-        L_shift = L + 1  # convert to {0, 1, ..., k}
-        self._set_constants(L_shift)
-        L_aug = self._get_augmented_label_matrix(L_shift)
+        if not is_augmented:
+            # This is the usual mode
+            L_shift = L + 1  # convert to {0, 1, ..., k}
+            self._set_constants(L_shift)  # TODO - Why do we need this here ?
+            L_aug = self._get_augmented_label_matrix(L_shift)
+        else:
+            # The data came in augmented format, and constants are already set
+            L_aug = L
         mu = self.mu.cpu().detach().numpy()
         jtm = np.ones(L_aug.shape[1])
 
@@ -588,8 +602,27 @@ class LabelModel(nn.Module, BaseLabeler):
             )
         self.P = torch.diag(torch.from_numpy(self.p)).float().to(self.config.device)
 
-    def _set_constants(self, L: np.ndarray) -> None:
-        self.n, self.m = L.shape
+    def _set_constants(
+        self,
+        L: Optional[np.ndarray] = None,
+        known_dimensions: Optional[KnownDimensions] = None,
+    ) -> None:
+        if L is None and known_dimensions is None:
+            raise ValueError(
+                "You must either provide a LabelMatrix or specify known_dimensions"
+            )
+        elif known_dimensions is not None:
+            self.n = known_dimensions.num_examples
+            self.m = known_dimensions.num_functions
+            self.d = known_dimensions.num_events
+            self.cardinality = known_dimensions.num_classes
+        elif L is not None:
+            # We know L is not none, but the linter can't figure it out ...
+            self.n, self.m = L.shape
+        else:
+            raise ValueError(
+                "Something impossible happened. This is here for the sake of the linter"
+            )
         if self.m < 3:
             raise ValueError("L_train should have at least 3 labeling functions")
         self.t = 1
@@ -597,6 +630,7 @@ class LabelModel(nn.Module, BaseLabeler):
     def _create_tree(self) -> None:
         nodes = range(self.m)
         self.c_tree = get_clique_tree(nodes, [])
+        self._calculate_clique_data()
 
     def _execute_logging(self, loss: torch.Tensor) -> Metrics:
         self.eval()
@@ -615,7 +649,6 @@ class LabelModel(nn.Module, BaseLabeler):
             # Reset running loss and examples counts
             self.running_loss = 0.0
             self.running_examples = 0
-
         self.train()
         return metrics_dict
 
@@ -869,13 +902,7 @@ class LabelModel(nn.Module, BaseLabeler):
         >>> label_model.fit(L, class_balance=[0.7, 0.3], n_epochs=200, l2=0.4)
         """
         # Set random seed
-        self.train_config: TrainConfig = merge_config(  # type:ignore
-            TrainConfig(), kwargs  # type:ignore
-        )
-        # Update base config so that it includes all parameters
-        random.seed(self.train_config.seed)
-        np.random.seed(self.train_config.seed)
-        torch.manual_seed(self.train_config.seed)
+        self._set_config_and_seed(**kwargs)
 
         L_shift = L_train + 1  # convert to {0, 1, ..., k}
         if L_shift.max() > self.cardinality:
@@ -884,8 +911,7 @@ class LabelModel(nn.Module, BaseLabeler):
             )
 
         self._set_constants(L_shift)
-        self._set_class_balance(class_balance, Y_dev)
-        self._create_tree()
+        self._training_preamble(class_balance=class_balance, Y_dev=Y_dev, **kwargs)
         lf_analysis = LFAnalysis(L_train)
         self.coverage = lf_analysis.lf_coverages()
 
@@ -893,6 +919,29 @@ class LabelModel(nn.Module, BaseLabeler):
         if self.config.verbose:  # pragma: no cover
             logging.info("Computing O...")
         self._generate_O(L_shift)
+        self._training_loop()
+
+    def _training_preamble(
+        self,
+        Y_dev: Optional[np.ndarray] = None,
+        class_balance: Optional[List[float]] = None,
+        **kwargs: Any
+    ) -> None:
+        """Perform the training preamble, regardless of user input."""
+        np.random.seed(self.train_config.seed)
+        torch.manual_seed(self.train_config.seed)
+        self._set_class_balance(class_balance, Y_dev)
+        self._create_tree()
+
+    def _set_config_and_seed(self, **kwargs: Any) -> None:
+        self.train_config: TrainConfig = merge_config(  # type:ignore
+            TrainConfig(), kwargs  # type:ignore
+        )
+        # Update base config so that it includes all parameters
+        random.seed(self.train_config.seed)
+
+    def _training_loop(self) -> None:
+        """Perform training logic that is shared across different fit methods, irrespective of the user input format."""
         self._init_params()
 
         # Estimate \mu
